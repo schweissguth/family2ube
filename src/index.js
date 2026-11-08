@@ -563,4 +563,376 @@ export default {
             filename: filename,
             key: key,
             uploadId: mp.uploadId,
- 
+            parts: parts,
+            size: b.size,
+            received: [],
+            created: Date.now(),
+          }),
+
+          {
+            httpMetadata: {
+              contentType:
+                "application/json",
+            },
+          }
+        );
+
+
+        return json({
+          job: job,
+          username: username,
+          folder: folder,
+          chunkSize: CHUNK_SIZE,
+          parts: parts,
+        });
+      }
+
+
+      //
+      // UPLOAD INDIVIDUAL PART
+      //
+
+      if (
+        request.method === "PUT" &&
+        p[0] === "api" &&
+        p[1] === "upload"
+      ) {
+
+        const job = p[2];
+        const n = Number(p[3]);
+
+
+        const mo =
+          await env.MEDIA.get(
+            "_jobs/" +
+            job +
+            "/meta.json"
+          );
+
+
+        if (!mo) {
+          return json(
+            {
+              error: "job not found",
+            },
+            404
+          );
+        }
+
+
+        const m =
+          await mo.json();
+
+
+        if (
+          !Number.isInteger(n) ||
+          n < 1 ||
+          n > m.parts
+        ) {
+
+          return json(
+            {
+              error: "bad part",
+            },
+            400
+          );
+        }
+
+
+        const upload =
+          env.MEDIA
+            .resumeMultipartUpload(
+              m.key,
+              m.uploadId
+            );
+
+
+        const part =
+          await upload.uploadPart(
+            n,
+            request.body
+          );
+
+
+        m.received =
+          m.received.filter(
+            function(x) {
+              return x.partNumber !== n;
+            }
+          );
+
+
+        m.received.push({
+          partNumber: n,
+          etag: part.etag,
+        });
+
+
+        await env.MEDIA.put(
+          "_jobs/" +
+          job +
+          "/meta.json",
+
+          JSON.stringify(m),
+
+          {
+            httpMetadata: {
+              contentType:
+                "application/json",
+            },
+          }
+        );
+
+
+        return json({
+          ok: true,
+          part: n,
+        });
+      }
+
+
+      //
+      // COMPLETE SOURCE MP4
+      //
+
+      if (
+        request.method === "POST" &&
+        p[0] === "api" &&
+        p[1] === "complete"
+      ) {
+
+        const job = p[2];
+
+
+        const mo =
+          await env.MEDIA.get(
+            "_jobs/" +
+            job +
+            "/meta.json"
+          );
+
+
+        if (!mo) {
+          return json(
+            {
+              error: "job not found",
+            },
+            404
+          );
+        }
+
+
+        const m =
+          await mo.json();
+
+
+        if (
+          m.received.length !==
+          m.parts
+        ) {
+
+          return json(
+            {
+              error:
+                "Only " +
+                m.received.length +
+                "/" +
+                m.parts +
+                " chunks received",
+            },
+            409
+          );
+        }
+
+
+        await env.MEDIA
+          .resumeMultipartUpload(
+            m.key,
+            m.uploadId
+          )
+          .complete(
+            m.received.sort(
+              function(a, b) {
+                return (
+                  a.partNumber -
+                  b.partNumber
+                );
+              }
+            )
+          );
+
+
+        await env.MEDIA.put(
+          "_jobs/" +
+          job +
+          "/status.json",
+
+          JSON.stringify({
+            stage: "queued",
+            percent: 0,
+            segments: 0,
+            done: false,
+          }),
+
+          {
+            httpMetadata: {
+              contentType:
+                "application/json",
+            },
+          }
+        );
+
+
+        const c =
+          getContainer(
+            env.HLS_CONTAINER,
+            job
+          );
+
+
+        const r =
+          await c.fetch(
+            new Request(
+              "http://container/start",
+              {
+                method: "POST",
+
+                headers: {
+                  "content-type":
+                    "application/json",
+                },
+
+                body:
+                  JSON.stringify(m),
+              }
+            )
+          );
+
+
+        if (!r.ok) {
+
+          return json(
+            {
+              error:
+                await r.text(),
+            },
+            500
+          );
+        }
+
+
+        return json({
+          ok: true,
+        });
+      }
+
+
+      //
+      // CONVERSION STATUS
+      //
+
+      if (
+        request.method === "GET" &&
+        p[0] === "api" &&
+        p[1] === "status"
+      ) {
+
+        const o =
+          await env.MEDIA.get(
+            "_jobs/" +
+            p[2] +
+            "/status.json"
+          );
+
+
+        return o
+          ? new Response(
+              o.body,
+              {
+                headers: {
+                  "content-type":
+                    "application/json",
+
+                  "cache-control":
+                    "no-store",
+                },
+              }
+            )
+          : json({
+              stage: "waiting",
+              percent: 0,
+            });
+      }
+
+
+      //
+      // SERVE HLS CONTENT
+      //
+
+      if (
+        request.method === "GET" &&
+        p[0] === "media" &&
+        p.length >= 4
+      ) {
+
+        const key =
+          p.slice(1)
+            .map(decodeURIComponent)
+            .join("/");
+
+
+        const o =
+          await env.MEDIA.get(key);
+
+
+        if (!o) {
+
+          return new Response(
+            "Not found",
+            {
+              status: 404,
+            }
+          );
+        }
+
+
+        return new Response(
+          o.body,
+          {
+            headers: {
+              "content-type":
+                o.httpMetadata?.contentType ||
+                "application/octet-stream",
+
+              "accept-ranges":
+                "bytes",
+
+              "access-control-allow-origin":
+                "*",
+            },
+          }
+        );
+      }
+
+
+      return new Response(
+        "Not found",
+        {
+          status: 404,
+        }
+      );
+
+
+    } catch (e) {
+
+      return json(
+        {
+          error:
+            e?.message ||
+            String(e),
+        },
+        500
+      );
+    }
+  },
+};
